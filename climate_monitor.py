@@ -64,6 +64,8 @@ CSV_HEADER = ["timestamp", "temperature_f", "humidity_percent"]
 
 def read_sensor(i2c) -> tuple[float, float]:
     sht = adafruit_sht4x.SHT4x(i2c)
+    sht.mode = adafruit_sht4x.Mode.NOHEAT_MEDPRECISION
+
     temperature_c, humidity_pct = sht.measurements
     temperature_f = temperature_c * 9 / 5 + 32
 
