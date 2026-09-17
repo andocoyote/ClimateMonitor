@@ -127,20 +127,48 @@ def run_rclone(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(["rclone"] + args, capture_output=True, text=True)
 
 
-def download_current_month(filename: str, local_path: str) -> None:
+def remote_file_exists(filename: str) -> bool:
+    """Check whether this month's file actually exists on OneDrive,
+    independent of whether we can successfully download it right now."""
+    remote_dir = f"{RCLONE_REMOTE}:{REMOTE_FOLDER}"
+    result = run_rclone(["lsf", remote_dir, "--include", filename])
+    return result.returncode == 0 and filename in result.stdout
+
+
+def download_current_month(filename: str, local_path: str) -> bool:
     """
-    Pull down this month's file from OneDrive if it exists. If it
-    doesn't exist yet (first run of a new month), start a fresh local
-    file with just the header row instead of failing.
+    Pull down this month's file from OneDrive.
+
+    Returns True if it's safe to proceed (either the download
+    succeeded, or the file genuinely doesn't exist yet and a fresh
+    one was started). Returns False if the file exists remotely but
+    we failed to download it for some other reason (network blip,
+    auth hiccup, etc.) — in that case the caller must NOT proceed to
+    upload, since doing so would overwrite real data with an
+    incomplete local copy. This is the fix for a real incident where
+    a transient download failure was misread as "new month" and the
+    resulting near-empty file was uploaded over two weeks of history.
     """
     remote_path = f"{RCLONE_REMOTE}:{REMOTE_FOLDER}/{filename}"
     result = run_rclone(["copyto", remote_path, local_path])
 
-    if result.returncode != 0:
-        print(f"No existing remote file found ({filename}); starting a new one.")
-        with open(local_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADER)
+    if result.returncode == 0:
+        return True
+
+    if remote_file_exists(filename):
+        print(
+            f"ERROR: {filename} exists on OneDrive but download failed "
+            f"(not proceeding, to avoid overwriting existing data): {result.stderr}",
+            file=sys.stderr,
+        )
+        return False
+
+    # Genuinely doesn't exist yet — safe to start fresh.
+    print(f"No existing remote file found ({filename}); starting a new one.")
+    with open(local_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADER)
+    return True
 
 
 def append_reading_to_csv(local_path: str, temperature_f: float, humidity_pct: float) -> None:
@@ -184,7 +212,16 @@ def main() -> int:
     filename = get_monthly_filename()
     local_path = os.path.join(LOCAL_SCRATCH_DIR, filename)
 
-    download_current_month(filename, local_path)
+    if not download_current_month(filename, local_path):
+        # File exists remotely but we couldn't download it — do NOT
+        # proceed to upload, since local_path doesn't reflect the real
+        # remote history and uploading it would overwrite real data.
+        # This hour's reading is lost, which is the acceptable
+        # trade-off; the alternative (uploading anyway) risks losing
+        # everything, which is not.
+        print("ERROR: skipping this hour's upload to avoid data loss.", file=sys.stderr)
+        return 1
+
     append_reading_to_csv(local_path, temperature_f, humidity_pct)
 
     if not upload_current_month(filename, local_path):
